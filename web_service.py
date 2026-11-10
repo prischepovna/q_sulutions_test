@@ -1,26 +1,64 @@
-import hashlib
 import os
-import sqlite3
-from urllib.parse import quote
+import time
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify, send_from_directory, g
-from werkzeug.utils import secure_filename
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-DB_NAME = os.path.join(BASE_DIR, 'videos.db')
 
 app = Flask(__name__)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER', os.path.join(BASE_DIR, 'uploads'))
+
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+SCHEMA_SQL = '''
+    CREATE TABLE IF NOT EXISTS videos (
+        id SERIAL PRIMARY KEY,
+        company_name TEXT NOT NULL UNIQUE,
+        video_url TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+'''
+
+
+def _db_params():
+    """Параметры подключения берутся только из переменных окружения."""
+    return {
+        'host': os.environ['DB_HOST'],
+        'port': os.environ.get('DB_PORT', '5432'),
+        'dbname': os.environ['DB_NAME'],
+        'user': os.environ['DB_USER'],
+        'password': os.environ['DB_PASSWORD'],
+    }
+
+
+def connect(retries=1, delay=2.0):
+    """Новое подключение к PostgreSQL с повторными попытками."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return psycopg2.connect(
+                cursor_factory=RealDictCursor,
+                connect_timeout=5,
+                **_db_params(),
+            )
+        except psycopg2.OperationalError as e:
+            last_error = e
+            if attempt < retries:
+                print(f'[db] not ready (attempt {attempt}/{retries}), retry in {delay}s', flush=True)
+                time.sleep(delay)
+    raise last_error
+
 
 def get_db():
+    # psycopg2-соединения не потокобезопасны: одно соединение на запрос.
     db = getattr(g, '_database', None)
     if db is None:
-        db = g._database = sqlite3.connect(DB_NAME, timeout=30.0)
-        db.row_factory = sqlite3.Row
-        db.execute('PRAGMA journal_mode=WAL;')
+        db = g._database = connect(retries=3, delay=1.0)
     return db
 
 
@@ -31,30 +69,19 @@ def close_connection(exception):
         db.close()
 
 
-def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute('PRAGMA journal_mode=WAL;')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS videos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company_name TEXT NOT NULL UNIQUE,
-                file_path TEXT NOT NULL,
-                video_url TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-        ''')
-        conn.commit()
+@app.errorhandler(psycopg2.OperationalError)
+def handle_db_unavailable(e):
+    return jsonify({'error': 'Database is unavailable'}), 503
 
 
-init_db()
-
-
-def make_filename(company_name: str) -> str:
-    safe = secure_filename(company_name.replace(' ', '_'))
-    if not safe:
-        safe = 'video_' + hashlib.sha1(company_name.encode('utf-8')).hexdigest()[:10]
-    return f"{safe}.webm"
+def init_db(retries=30, delay=2.0):
+    conn = connect(retries=retries, delay=delay)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(SCHEMA_SQL)
+    finally:
+        conn.close()
 
 
 @app.route('/upload', methods=['POST'])
@@ -63,29 +90,33 @@ def upload_video():
         return jsonify({'error': 'No file part'}), 400
 
     file = request.files['file']
-    company_name = (request.form.get('company_name') or '').strip()
+    company_name = request.form.get('company_name')
 
     if not company_name or file.filename == '':
         return jsonify({'error': 'Company name and file are required'}), 400
 
-    filename = make_filename(company_name)
+    filename = f"{company_name.replace('/', '_').replace(' ', '_')}.webm"
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
 
-    video_url = f"{request.host_url.rstrip('/')}/media/{quote(filename)}"
+    video_url = f"{request.host_url.rstrip('/')}/media/{filename}"
 
     db = get_db()
-    db.execute('''
-        INSERT INTO videos (company_name, video_url, file_path, updated_at)
-        VALUES (?, ?, ?, datetime('now'))
-        ON CONFLICT(company_name) DO UPDATE SET
-            video_url = excluded.video_url,
-            file_path = excluded.file_path,
-            updated_at = datetime('now');
-    ''', (company_name, video_url, file_path))
+    with db.cursor() as cur:
+        cur.execute('''
+            INSERT INTO videos (company_name, video_url, file_path, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (company_name) DO UPDATE SET
+                video_url = EXCLUDED.video_url,
+                file_path = EXCLUDED.file_path,
+                updated_at = NOW();
+        ''', (company_name, video_url, file_path))
     db.commit()
 
-    return jsonify({'company_name': company_name, 'video_url': video_url}), 200
+    return jsonify({
+        'company_name': company_name,
+        'video_url': video_url
+    }), 200
 
 
 @app.route('/get_video_url', methods=['GET'])
@@ -94,15 +125,21 @@ def get_video_url():
     if not company_name:
         return jsonify({'error': 'company_name parameter is required'}), 400
 
-    row = get_db().execute(
-        'SELECT company_name, video_url FROM videos WHERE company_name = ?',
-        (company_name,)
-    ).fetchone()
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            'SELECT company_name, video_url FROM videos WHERE company_name = %s',
+            (company_name,),
+        )
+        row = cur.fetchone()
 
     if not row:
         return jsonify({'error': 'Company not found'}), 404
 
-    return jsonify({'company_name': row['company_name'], 'video_url': row['video_url']}), 200
+    return jsonify({
+        'company_name': row['company_name'],
+        'video_url': row['video_url']
+    }), 200
 
 
 @app.route('/media/<path:filename>', methods=['GET'])
@@ -110,17 +147,10 @@ def serve_media(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 
-@app.route('/videos', methods=['GET'])
-def list_videos():
-    rows = get_db().execute(
-        'SELECT id, company_name, video_url, file_path, created_at, updated_at '
-        'FROM videos ORDER BY id'
-    ).fetchall()
-    return jsonify([dict(r) for r in rows]), 200
-
-
 if __name__ == '__main__':
+    # Локальный запуск без Docker (нужны те же DB_* переменные окружения).
+    init_db()
+
     host = os.environ.get('FLASK_HOST', '0.0.0.0')
     port = int(os.environ.get('FLASK_PORT', 8000))
-    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
-    app.run(host=host, port=port, debug=debug)
+    app.run(host=host, port=port, debug=False)

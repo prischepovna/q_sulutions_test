@@ -1,0 +1,14 @@
+venv/
+.git/
+.idea/
+__pycache__/
+video/
+uploads/
+videos.db*
+qscript.py
+capture_video.py
+video_client.py
+input.csv
+requirements-client.txt
+.env
+README.md
