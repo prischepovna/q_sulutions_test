@@ -2,9 +2,18 @@ import os
 import time
 import glob
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 PATH_TO_VIDEO_FOLDER = "./video"
+PATH_TO_DEBUG_FOLDER = "./debug"
+
+# DuckDuckGo меняет разметку выдачи, поэтому ищем первый результат по нескольким селекторам
+RESULT_SELECTOR = ", ".join([
+    'a[data-testid="result-title-a"]',
+    'article[data-testid="result"] h2 a',
+    'a.result__a',
+    '#links h2 a',
+])
 
 INJECT_EFFECTS_JS = """
 (() => {
@@ -25,6 +34,19 @@ INJECT_EFFECTS_JS = """
             <path d="M5 3L25 15L15 18L10 27L5 3Z" fill="white" stroke="black" stroke-width="2.5" stroke-linejoin="round"/>
         </svg>
     `;
+    // жёлтая подсветка вокруг курсора: лежит внутри cursor, поэтому двигается вместе с ним
+    const highlight = document.createElement('div');
+    highlight.style.position = 'absolute';
+    highlight.style.width = '60px';
+    highlight.style.height = '60px';
+    highlight.style.left = '-24px';   // центр круга совпадает с кончиком стрелки
+    highlight.style.top = '-27px';
+    highlight.style.borderRadius = '50%';
+    highlight.style.backgroundColor = 'rgba(255, 213, 79, 0.6)';
+    highlight.style.pointerEvents = 'none';
+    highlight.style.zIndex = '-1';   // круг строго ПОД стрелкой
+    cursor.insertBefore(highlight, cursor.firstChild);   // под стрелкой, а не поверх неё
+
     document.documentElement.appendChild(cursor);
 
     document.addEventListener('mousemove', (e) => {
@@ -32,7 +54,7 @@ INJECT_EFFECTS_JS = """
         cursor.style.top = e.clientY + 'px';
     }, true);
 
-   
+
     document.addEventListener('click', (e) => {
         const ripple = document.createElement('div');
         ripple.style.position = 'fixed';
@@ -60,7 +82,7 @@ INJECT_EFFECTS_JS = """
     `;
     document.head.appendChild(style);
 
-   
+
     window.ShowCallout = (text, bgColor = '#FFFF99', textColor = '#000000', fadeMs = 2000) => {
         const callout = document.createElement('div');
         callout.innerText = text;
@@ -138,7 +160,16 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
             page.wait_for_load_state("domcontentloaded")
             page.wait_for_timeout(2000)
 
-            first_result = page.wait_for_selector('a[data-testid="result-title-a"]', timeout=15000)
+            first_result = None
+            try:
+                first_result = page.wait_for_selector(RESULT_SELECTOR, timeout=30000)
+            except PlaywrightTimeoutError:
+                # Капча, страница согласия или другая разметка: не роняем запись,
+                # сохраняем скриншот для отладки и просто завершаем ролик.
+                os.makedirs(PATH_TO_DEBUG_FOLDER, exist_ok=True)
+                shot = os.path.join(PATH_TO_DEBUG_FOLDER, f"{company_name}_no_results.png")
+                page.screenshot(path=shot)
+                print(f"[WARN] Search results not found for {company_name}; screenshot: {shot}")
 
             if first_result:
                 res_box = first_result.bounding_box()
@@ -159,7 +190,7 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
         browser.close()
 
     final_files = set(os.listdir(PATH_TO_VIDEO_FOLDER))
-    new_files = list(final_files - initial_files)
+    new_files = [f for f in (final_files - initial_files) if f.endswith(".webm")]
 
     if not new_files:
         webm_files = glob.glob(os.path.join(PATH_TO_VIDEO_FOLDER, "*.webm"))
