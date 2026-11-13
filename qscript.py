@@ -1,13 +1,19 @@
 import os
 import time
 import glob
+import json
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 PATH_TO_VIDEO_FOLDER = "./video"
 PATH_TO_DEBUG_FOLDER = "./debug"
 
-# DuckDuckGo меняет разметку выдачи, поэтому ищем первый результат по нескольким селекторам
+# Zoom defaults (written into the sidecar)
+VIEWPORT_W, VIEWPORT_H = 1280, 720
+VIDEO_FPS = 25
+ZOOM_FACTOR = 2.0
+RAMP_SEC = 0.5
+
 RESULT_SELECTOR = ", ".join([
     'a[data-testid="result-title-a"]',
     'article[data-testid="result"] h2 a',
@@ -17,6 +23,13 @@ RESULT_SELECTOR = ", ".join([
 
 INJECT_EFFECTS_JS = """
 (() => {
+    // Скрипт запускается и как init-script (до появления document.documentElement),
+    // и повторно из сценария. Поэтому: ставим эффекты один раз и только когда DOM готов.
+    if (window.__effectsInstalled) return;
+    const install = () => {
+    if (window.__effectsInstalled) return;
+    window.__effectsInstalled = true;
+    // ── Custom cursor ────────────────────────────────────────────
     const oldCursor = document.getElementById('__custom_svg_cursor');
     if (oldCursor) oldCursor.remove();
 
@@ -49,12 +62,18 @@ INJECT_EFFECTS_JS = """
 
     document.documentElement.appendChild(cursor);
 
+    // ── Mouse position tracker ───────────────────────────────────
+    window.__mouseX = 640;
+    window.__mouseY = 360;
+
     document.addEventListener('mousemove', (e) => {
         cursor.style.left = e.clientX + 'px';
         cursor.style.top = e.clientY + 'px';
+        window.__mouseX = e.clientX;
+        window.__mouseY = e.clientY;
     }, true);
 
-
+    // ── Click ripple ─────────────────────────────────────────────
     document.addEventListener('click', (e) => {
         const ripple = document.createElement('div');
         ripple.style.position = 'fixed';
@@ -79,10 +98,15 @@ INJECT_EFFECTS_JS = """
             0% { transform: scale(0.4); opacity: 1; }
             100% { transform: scale(1.8); opacity: 0; }
         }
+        @keyframes __zoom_ring_pulse {
+            0%   { transform: scale(1);   opacity: 0.9; }
+            50%  { transform: scale(1.1); opacity: 0.6; }
+            100% { transform: scale(1);   opacity: 0.9; }
+        }
     `;
     document.head.appendChild(style);
 
-
+    // ── Callout ──────────────────────────────────────────────────
     window.ShowCallout = (text, bgColor = '#FFFF99', textColor = '#000000', fadeMs = 2000) => {
         const callout = document.createElement('div');
         callout.innerText = text;
@@ -109,27 +133,127 @@ INJECT_EFFECTS_JS = """
             setTimeout(() => callout.remove(), fadeMs);
         }, fadeMs + 1000);
     };
+
+    // ── Zoom indicator ring ──────────────────────────────────────
+    window.__zoomActive = false;
+    let zoomRing = null;
+
+    function showZoomRing() {
+        if (zoomRing) zoomRing.remove();
+        zoomRing = document.createElement('div');
+        zoomRing.id = '__zoom_ring';
+        zoomRing.style.position = 'fixed';
+        zoomRing.style.width = '80px';
+        zoomRing.style.height = '80px';
+        zoomRing.style.left = (window.__mouseX - 40) + 'px';
+        zoomRing.style.top = (window.__mouseY - 40) + 'px';
+        zoomRing.style.borderRadius = '50%';
+        zoomRing.style.border = '3px solid rgba(255, 60, 60, 0.8)';
+        zoomRing.style.backgroundColor = 'rgba(255, 60, 60, 0.15)';
+        zoomRing.style.pointerEvents = 'none';
+        zoomRing.style.zIndex = '2147483646';
+        zoomRing.style.animation = '__zoom_ring_pulse 1s ease-in-out infinite';
+        document.documentElement.appendChild(zoomRing);
+
+        // ring follows cursor
+        document.addEventListener('mousemove', moveZoomRing, true);
+    }
+
+    function moveZoomRing(e) {
+        if (zoomRing) {
+            zoomRing.style.left = (e.clientX - 40) + 'px';
+            zoomRing.style.top = (e.clientY - 40) + 'px';
+        }
+    }
+
+    function hideZoomRing() {
+        document.removeEventListener('mousemove', moveZoomRing, true);
+        if (zoomRing) { zoomRing.remove(); zoomRing = null; }
+    }
+
+    // ── Zoom toggle (programmatic hook) ──────────────────────────
+    // __onZoomEvent is exposed from Python via page.expose_function.
+    // It may not be available yet when the init script runs, so we
+    // guard every call.  The function is async (returns a Promise)
+    // because expose_function callbacks are always async in Playwright.
+
+    window.__zoomAt = (x, y) => {
+        const pt = JSON.stringify({x: Math.round(x), y: Math.round(y)});
+        if (typeof window.__onZoomEvent === 'function') {
+            // тип события (in/out) определяет Python: состояние зума живёт между страницами
+            return window.__onZoomEvent(pt).then((evType) => {
+                window.__zoomActive = (evType === 'in');
+                if (window.__zoomActive) showZoomRing(); else hideZoomRing();
+            });
+        }
+        window.__zoomActive = !window.__zoomActive;
+        if (window.__zoomActive) showZoomRing(); else hideZoomRing();
+    };
+
+    // ── F5 hotkey ────────────────────────────────────────────────
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'F5') {
+            e.preventDefault();
+            e.stopPropagation();
+            window.__zoomAt(window.__mouseX, window.__mouseY);
+        }
+    }, true);
+
+    // после перехода на новую страницу восстанавливаем кольцо, если зум ещё включён
+    if (typeof window.__zoomState === 'function') {
+        window.__zoomState().then((active) => {
+            window.__zoomActive = !!active;
+            if (active) showZoomRing();
+        }).catch(() => {});
+    }
+    };
+    if (document.documentElement && document.head) {
+        install();
+    } else {
+        document.addEventListener('DOMContentLoaded', install, {once: true});
+    }
 })();
 """
 
 
-def CaptureVideo_Magento(url, company_name, language, country, postcode, city, street, house_no):
+def CaptureVideo_Magento(url, company_name, language, country, postcode, city, street, house_no, trigger_zoom=False):
+
     os.makedirs(PATH_TO_VIDEO_FOLDER, exist_ok=True)
 
     initial_files = set(os.listdir(PATH_TO_VIDEO_FOLDER))
+
+    zoom_events = []
+    t0 = None   # set right after context creation
+
+    def _on_zoom_event(payload_json):
+
+        ev = json.loads(payload_json)
+        ev["type"] = "out" if zoom_events and zoom_events[-1]["type"] == "in" else "in"
+        ev["t"] = round(time.time() - t0, 3)
+        zoom_events.append(ev)
+        print(f"[ZOOM] {ev['type']} at ({ev['x']}, {ev['y']}) t={ev['t']:.3f}s")
+        return ev["type"]
+
+    def _zoom_state():
+        return bool(zoom_events and zoom_events[-1]["type"] == "in")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
 
         context = browser.new_context(
             record_video_dir=PATH_TO_VIDEO_FOLDER,
-            record_video_size={"width": 1280, "height": 720},
-            viewport={"width": 1280, "height": 720}
+            record_video_size={"width": VIEWPORT_W, "height": VIEWPORT_H},
+            viewport={"width": VIEWPORT_W, "height": VIEWPORT_H}
         )
 
         context.add_init_script(INJECT_EFFECTS_JS)
 
+        t0 = time.time()   # ← video recording starts with the page: t=0
         page = context.new_page()
+
+        # Expose Python callback so JS __zoomAt can send events back
+        page.expose_function("__onZoomEvent", _on_zoom_event)
+        page.expose_function("__zoomState", _zoom_state)
 
         try:
             page.goto(url, wait_until="domcontentloaded")
@@ -151,6 +275,9 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
             page.wait_for_timeout(300)
             search_box.click()
 
+            if trigger_zoom:
+                page.evaluate("window.__zoomAt && window.__zoomAt(window.__mouseX, window.__mouseY)")
+
             query = f"Magento developer in {city}"
             for char in query:
                 page.keyboard.type(char, delay=120)
@@ -159,6 +286,11 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
 
             page.wait_for_load_state("domcontentloaded")
             page.wait_for_timeout(2000)
+
+            if trigger_zoom:
+
+                page.evaluate(INJECT_EFFECTS_JS)
+                page.evaluate("window.__zoomAt && window.__zoomAt(window.__mouseX, window.__mouseY)")
 
             first_result = None
             try:
@@ -184,7 +316,7 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
             print(f"Error during automation for {company_name}: {e}")
             context.close()
             browser.close()
-            return None
+            return None, None
 
         context.close()
         browser.close()
@@ -195,7 +327,7 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
     if not new_files:
         webm_files = glob.glob(os.path.join(PATH_TO_VIDEO_FOLDER, "*.webm"))
         if not webm_files:
-            return None
+            return None, None
         latest_file = max(webm_files, key=os.path.getctime)
     else:
         latest_file = os.path.join(PATH_TO_VIDEO_FOLDER, new_files[0])
@@ -206,4 +338,20 @@ def CaptureVideo_Magento(url, company_name, language, country, postcode, city, s
 
     os.rename(latest_file, target_path)
 
-    return os.path.abspath(target_path)
+    sidecar_path = None
+    if zoom_events:
+        sidecar_path = os.path.join(
+            PATH_TO_VIDEO_FOLDER, f"{company_name}.zoom.json")
+        sidecar_data = {
+            "viewport": {"width": VIEWPORT_W, "height": VIEWPORT_H},
+            "fps": VIDEO_FPS,
+            "zoom_factor": ZOOM_FACTOR,
+            "ramp_sec": RAMP_SEC,
+            "events": zoom_events,
+        }
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            json.dump(sidecar_data, f, indent=2)
+        print(f"[ZOOM] Sidecar written: {sidecar_path}  ({len(zoom_events)} events)")
+        sidecar_path = os.path.abspath(sidecar_path)
+
+    return os.path.abspath(target_path), sidecar_path
