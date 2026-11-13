@@ -3,9 +3,9 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# apache2-dev + build-essential нужны для сборки mod_wsgi, curl - для отладки
+# apache2-dev + build-essential нужны для сборки mod_wsgi, curl - для отладки, ffmpeg - для зума
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        apache2 apache2-dev build-essential curl \
+        apache2 apache2-dev build-essential curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,7 +20,7 @@ RUN mod_wsgi-express module-config > /etc/apache2/mods-available/wsgi.load \
 COPY apache/videoapp.conf /etc/apache2/sites-available/videoapp.conf
 RUN a2dissite 000-default && a2ensite videoapp
 
-COPY web_service.py app.wsgi ./
+COPY web_service.py app.wsgi apply_zoom.py ./
 COPY docker/entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh \
