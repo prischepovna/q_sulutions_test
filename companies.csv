@@ -1,0 +1,7 @@
+URL;Company Name;Language;Country;Postcode;City;Street;HouseNo;Web
+http://nutrimmun.de;nutrimmun GmbH;DE;DE;;;;;http://nutrimmun.de
+http://baroloandchampagne.com;Barolo & Champagne GbR;DE;DE;;;;;http://baroloandchampagne.com
+https://example.com;NoImpressumCorp;EN;US;94016;San Francisco;Market;100;https://example.com
+http://nonexistent-domain-xyz-404.de;UnreachableCorp;DE;DE;10115;Berlin;Mitte;1;http://nonexistent-domain-xyz-404.de
+;EmptyWebCorp;EN;US;10001;New York;Broadway;50;
+https://duckduckgo.com;AcmeCorp;EN;Belarus;4015;Gomel;Lenina;10;https://duckduckgo.com

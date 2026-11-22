@@ -11,6 +11,8 @@ services:
       DB_NAME: ${DB_NAME:-videos}
       DB_USER: ${DB_USER:-video_user}
       DB_PASSWORD: ${DB_PASSWORD:-video_pass}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
     depends_on:
       db:
         condition: service_healthy
