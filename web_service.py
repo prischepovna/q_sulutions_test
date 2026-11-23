@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import csv
 import io
 import os
@@ -5,6 +7,9 @@ import sys
 import time
 import subprocess
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -18,7 +23,7 @@ UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER', os.path.join(BASE_DIR, 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-SCHEMA_SQL = '''
+SCHEMA_FALLBACK_SQL = '''
     CREATE TABLE IF NOT EXISTS videos (
         id SERIAL PRIMARY KEY,
         company_name TEXT NOT NULL UNIQUE,
@@ -59,15 +64,22 @@ SCHEMA_SQL = '''
     CREATE INDEX IF NOT EXISTS idx_companies_name ON companies(company_name);
 '''
 
+SCHEMA_FILE = os.path.join(BASE_DIR, 'schema.sql')
+if os.path.exists(SCHEMA_FILE):
+    with open(SCHEMA_FILE, 'r', encoding='utf-8') as _f:
+        SCHEMA_SQL = _f.read()
+else:
+    SCHEMA_SQL = SCHEMA_FALLBACK_SQL
+
 
 def _db_params():
-    """Параметры подключения берутся только из переменных окружения."""
+    """Параметры подключения берутся из переменных окружения."""
     return {
-        'host': os.environ['DB_HOST'],
+        'host': os.environ.get('DB_HOST', 'localhost'),
         'port': os.environ.get('DB_PORT', '5432'),
-        'dbname': os.environ['DB_NAME'],
-        'user': os.environ['DB_USER'],
-        'password': os.environ['DB_PASSWORD'],
+        'dbname': os.environ.get('DB_NAME') or os.environ.get('пDB_NAME', 'videos'),
+        'user': os.environ.get('DB_USER', 'video_user'),
+        'password': os.environ.get('DB_PASSWORD', 'video_pass'),
     }
 
 
@@ -403,23 +415,31 @@ def upload_companies():
 def list_companies():
     status_param = request.args.get('status')
     status_val = None
+    filter_null = False
+
     if status_param is not None:
-        try:
-            status_val = int(status_param)
-        except ValueError:
-            return jsonify({'error': 'Invalid status parameter'}), 400
+        trimmed = status_param.strip().lower()
+        if trimmed in ('null', 'none', 'pending'):
+            filter_null = True
+        else:
+            try:
+                status_val = int(status_param)
+            except ValueError:
+                return jsonify({'error': 'Invalid status parameter'}), 400
 
     db = get_db()
 
     query = '''
         SELECT id, company_name, language, country, postcode, city, street, house_no,
                web, status, impressum_url, legal_name, postal_address, handelsregister,
-               vat_number, phone, email, responsible_person, created_at, updated_at
+               vat_number, phone, email, responsible_person, raw_json, created_at, updated_at
         FROM companies
     '''
     params = []
 
-    if status_val is not None:
+    if filter_null:
+        query += ' WHERE status IS NULL'
+    elif status_val is not None:
         query += ' WHERE status = %s'
         params.append(status_val)
 
@@ -432,7 +452,7 @@ def list_companies():
     return jsonify([_serialize_company(r) for r in rows]), 200
 
 
-@app.route('/companies/<company_name>', methods=['GET'])
+@app.route('/companies/<path:company_name>', methods=['GET'])
 def get_company(company_name):
     db = get_db()
     with db.cursor() as cur:

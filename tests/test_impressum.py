@@ -114,11 +114,11 @@ class TestExtractCleanText:
 
 class TestTokenOptimization:
     def test_sandwich_cutting_with_anchors(self):
-        filler_before = "Welcome to our store! " * 50
+        filler_before = "Welcome to our store! " * 250
         legal_head = "Impressum\nAngaben gemäß § 5 TMG:\n"
         company_body = "Muster GmbH\nMusterstraße 12\n10115 Berlin\n"
         legal_tail = "Geschäftsführer: Max Mustermann\nHandelsregister: Amtsgericht Berlin HRB 123456\nUSt-IdNr.: DE123456789\nE-Mail: info@muster.de\nTelefon: +49 30 1234567\n"
-        filler_after = "Check out our latest blog posts! " * 50
+        filler_after = "Check out our latest blog posts! " * 250
 
         full_text = f"{filler_before}\n{legal_head}{company_body}{legal_tail}\n{filler_after}"
         optimized, stats = optimize_impressum_text(full_text)
@@ -131,6 +131,14 @@ class TestTokenOptimization:
         assert stats.chars_after < stats.chars_before
         assert stats.reduction_pct > 0
         assert stats.tokens_after <= stats.tokens_before
+
+    def test_text_under_threshold_sent_unchanged(self):
+        short_text = "Impressum\nAngaben gemäß § 5 TMG\nMuster GmbH\nDE123456789\n"
+        optimized, stats = optimize_impressum_text(short_text, max_chars=8000)
+        assert optimized == short_text
+        assert stats.chars_before == len(short_text)
+        assert stats.chars_after == len(short_text)
+        assert stats.reduction_pct == 0.0
 
     def test_respects_max_chars(self):
         huge_text = "Impressum " + ("Mustertext " * 2000) + "DE123456789"
@@ -352,3 +360,21 @@ class TestProcessCompanyPipeline:
         assert res.vat_number == "DE126116348"
         assert res.postal_address == "Ludgeriplatz 2, 48153 Münster, DE"
         assert res.stats.chars_after > 0
+
+    @patch("impressum.fetch_url")
+    def test_unparseable_llm_response_yields_status_2(self, mock_fetch):
+        from impressum import UnparseableLLMResponseError
+        home_html = '<html><body><a href="/impressum">Impressum</a></body></html>'
+        imp_html = '<html><body><h1>Impressum</h1><p>Some text</p></body></html>'
+        mock_fetch.side_effect = [(200, home_html), (200, imp_html)]
+
+        mock_deepseek_fn = MagicMock(side_effect=UnparseableLLMResponseError("Could not parse JSON"))
+
+        res = process_company(
+            "http://example.com",
+            api_key="sk-test",
+            deepseek_fn=mock_deepseek_fn,
+        )
+
+        assert res.status == CompanyStatus.PARSING_FAILED
+        assert "unparseable response" in res.error_message

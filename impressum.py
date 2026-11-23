@@ -31,6 +31,11 @@ class CompanyStatus(IntEnum):
     NO_IMPRESSUM_LINK = 1
 
 
+class UnparseableLLMResponseError(Exception):
+    """Raised when DeepSeek returned an unparseable or blank response even after retries."""
+    pass
+
+
 # Anchor patterns
 HEAD_ANCHOR_PATTERNS = [
     re.compile(r"(?i)\bangaben\s+gem[äa]ß\s+§\s*5\s*(?:tmg|ddg)\b"),
@@ -179,6 +184,15 @@ def extract_clean_text(html_content: str) -> str:
         tag.decompose()
 
     text = soup.get_text(separator="\n", strip=True)
+    # Filter boilerplate lines (§5.1)
+    filtered_lines = []
+    boilerplate_line_re = re.compile(r"(?i)^(?:cookie(?:-|\s+)?(?:banner|settings|einstellungen|hinweis)|wir\s+verwenden\s+cookies|alle\s+rechte\s+vorbehalten|all\s+rights\s+reserved|©\s*\d{4})")
+    for line in text.splitlines():
+        line_s = line.strip()
+        if not line_s or boilerplate_line_re.search(line_s):
+            continue
+        filtered_lines.append(line_s)
+    text = "\n".join(filtered_lines)
     # Collapse 3+ newlines to 2 newlines
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -187,17 +201,28 @@ def extract_clean_text(html_content: str) -> str:
 def optimize_impressum_text(raw_text: str, max_chars: int = MAX_TEXT_CHARS) -> tuple[str, TokenStats]:
     """
     Applies Token Optimization ('sandwich cutting'):
-    1. Finds first head anchor (e.g. 'Angaben gemäß § 5 TMG', 'Impressum').
-    2. Finds last tail anchor (e.g. phone, VAT DE..., Handelsregister, email).
-    3. Slices text: [head - 100 : tail + 400].
-    4. Limits to max_chars.
-    5. Calculates before/after token counts and reduction percentage.
+    1. If text is under max_chars threshold, send unchanged (§5).
+    2. Finds first head anchor (e.g. 'Angaben gemäß § 5 TMG', 'Impressum').
+    3. Finds last tail anchor (e.g. phone, VAT DE..., Handelsregister, email).
+    4. Slices text: [head - 100 : tail + 400].
+    5. Limits to max_chars.
+    6. Calculates before/after token counts and reduction percentage.
     """
     chars_before = len(raw_text)
     tokens_before = max(0, chars_before // 4)
 
     if not raw_text:
         return "", TokenStats(chars_before=0, chars_after=0, tokens_before=0, tokens_after=0, reduction_pct=0.0)
+
+    # §5: If visible text is under threshold, send it unchanged
+    if chars_before <= max_chars:
+        return raw_text, TokenStats(
+            chars_before=chars_before,
+            chars_after=chars_before,
+            tokens_before=tokens_before,
+            tokens_after=tokens_before,
+            reduction_pct=0.0,
+        )
 
     # 1. Locate head anchor
     head_start = None
@@ -322,6 +347,7 @@ def call_deepseek_extraction(
 
     import time
     last_err = None
+    is_response_parse_error = False
 
     for attempt in range(max_retries):
         try:
@@ -331,15 +357,23 @@ def call_deepseek_extraction(
             result = resp.json()
             content = result["choices"][0]["message"]["content"]
             if not content or not content.strip():
+                is_response_parse_error = True
                 raise ValueError("DeepSeek returned blank content")
 
             data = json.loads(content)
             return data
+        except json.JSONDecodeError as e:
+            last_err = e
+            is_response_parse_error = True
+            if attempt < max_retries - 1:
+                time.sleep(1.5 * (attempt + 1))
         except Exception as e:
             last_err = e
             if attempt < max_retries - 1:
                 time.sleep(1.5 * (attempt + 1))
 
+    if is_response_parse_error:
+        raise UnparseableLLMResponseError(f"DeepSeek response could not be parsed: {last_err}")
     raise last_err or RuntimeError("DeepSeek extraction failed after retries")
 
 
@@ -452,7 +486,7 @@ def process_company(
     if not impressum_url:
         return CompanyEnrichmentResult(
             status=CompanyStatus.NO_IMPRESSUM_LINK,
-            error_message="No Impressum or Imprint link found on homepage",
+            error_message=f"No Impressum or Imprint link found on homepage: {normalized}",
         )
 
     # Fetch impressum page
@@ -478,6 +512,13 @@ def process_company(
     # DeepSeek extraction
     try:
         raw_json = deepseek_fn(optimized_text, api_key=api_key, model=model)
+    except UnparseableLLMResponseError as e:
+        return CompanyEnrichmentResult(
+            status=CompanyStatus.PARSING_FAILED,
+            impressum_url=impressum_url,
+            stats=stats,
+            error_message=f"DeepSeek returned unparseable response: {e}",
+        )
     except Exception as e:
         return CompanyEnrichmentResult(
             status=CompanyStatus.ERROR,

@@ -21,8 +21,10 @@ RUN mod_wsgi-express module-config > /etc/apache2/mods-available/wsgi.load \
 COPY apache/videoapp.conf /etc/apache2/sites-available/videoapp.conf
 RUN a2dissite 000-default && a2ensite videoapp
 
-COPY web_service.py app.wsgi apply_zoom.py ./
+COPY web_service.py app.wsgi apply_zoom.py enrich_companies.py impressum.py schema.sql companies.csv ./
 COPY docker/entrypoint.sh /entrypoint.sh
+
+ENV DEEPSEEK_API_KEY=""
 
 RUN chmod +x /entrypoint.sh \
     && mkdir -p /app/uploads \

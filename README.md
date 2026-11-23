@@ -104,7 +104,8 @@ Response:
 {
   "status": "ok",
   "imported": 6,
-  "updated": 0
+  "updated": 0,
+  "total_rows": 6
 }
 ```
 *Idempotent: Re-uploading updates base info without overwriting existing enrichment results.*
